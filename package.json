@@ -1,0 +1,15 @@
+{
+  "name": "deepseek-harness-deploy",
+  "private": true,
+  "description": "Portable DeepSeek Harness launcher with Tailscale LAN patches",
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "scripts": {
+    "start": "powershell -NoProfile -ExecutionPolicy Bypass -File ./start.ps1",
+    "install:deps": "npm ci --no-fund --no-audit || npm install --no-fund --no-audit"
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh": "^0.1.5-rc.3"
+  }
+}

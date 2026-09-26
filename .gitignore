@@ -1,0 +1,19 @@
+node_modules/
+npm-debug.log*
+yarn-error.log*
+.pnpm-store/
+
+# Unrelated local tooling / runtime data (not part of harness deploy)
+codex-standalone/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# Local secrets if ever dropped here (real secrets live in %USERPROFILE%\.dsh)
+.env
+.env.*
+*.pem
