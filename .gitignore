@@ -17,3 +17,8 @@ Thumbs.db
 .env
 .env.*
 *.pem
+
+# Launcher runtime / packaging output (regenerable, do not commit)
+logs/
+dist/
+dsh-web-token.txt

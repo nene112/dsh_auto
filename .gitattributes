@@ -1,0 +1,7 @@
+# Shell scripts must keep LF line endings so they run on Linux regardless of
+# the committer's core.autocrlf setting.
+*.sh text eol=lf
+
+# Markdown and scripts stay text (line-ending normalization is fine).
+*.md text
+*.ps1 text
