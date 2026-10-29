@@ -21,4 +21,5 @@ Thumbs.db
 # Launcher runtime / packaging output (regenerable, do not commit)
 logs/
 dist/
+.runtime/
 dsh-web-token.txt

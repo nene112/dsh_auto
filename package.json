@@ -1,7 +1,7 @@
 {
   "name": "deepseek-harness-deploy",
   "private": true,
-  "description": "Portable DeepSeek Harness launcher with Tailscale LAN patches",
+  "description": "Portable DeepSeek Harness launcher with automatic environment setup and optional Tailscale access",
   "engines": {
     "node": "^22.19.0 || >=24.0.0"
   },

@@ -5,24 +5,47 @@
 
 .DESCRIPTION
   Cross-machine bootstrap for this repo:
-  - Checks Node.js / npm (offers winget install if missing on Windows)
+  - Checks Node.js / npm and downloads a private compatible Node runtime when needed
+  - Prefers China-accessible Node/npm mirrors and falls back to official sources
   - Runs npm ci / npm install when node_modules is missing
   - Re-applies local UI patches after install
-  - Optionally exposes the UI on Tailscale :8443 (leaves :443 free)
+  - Optionally exposes the UI on Tailscale when -Tailscale is passed
   - Prints local + Tailscale URLs with the process token
 
 .EXAMPLE
   powershell -ExecutionPolicy Bypass -File .\start.ps1
+
+.EXAMPLE
+  powershell -ExecutionPolicy Bypass -File .\start.ps1 -CheckOnly
+
+.EXAMPLE
+  powershell -ExecutionPolicy Bypass -File .\start.ps1 -Tailscale
 #>
+[CmdletBinding()]
+param(
+  [int]$Port = $(if ($env:DSH_PORT) { [int]$env:DSH_PORT } else { 3080 }),
+  [int]$TsHttpsPort = $(if ($env:DSH_TS_HTTPS_PORT) { [int]$env:DSH_TS_HTTPS_PORT } else { 8443 }),
+  [ValidateSet("auto", "china", "official")]
+  [string]$Mirror = $(if ($env:DSH_MIRROR) { $env:DSH_MIRROR } else { "auto" }),
+  [string]$NodePrefix = $(if ($env:DSH_NODE_PREFIX) { $env:DSH_NODE_PREFIX } else { "" }),
+  [switch]$CheckOnly,
+  [switch]$ForceNode,
+  [switch]$Tailscale
+)
+
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
+if (-not $NodePrefix) { $NodePrefix = Join-Path $PSScriptRoot ".runtime\node" }
 
-$Port = if ($env:DSH_PORT) { [int]$env:DSH_PORT } else { 3080 }
-$TsHttpsPort = if ($env:DSH_TS_HTTPS_PORT) { [int]$env:DSH_TS_HTTPS_PORT } else { 8443 }
 # Official dsh: Node ^22.19.0 || >=24
 $MinNodeMajor = 22
 $MinNodeMinorIf22 = 19
+$NodeMajorTarget = 24
+$ChinaNodeMirror = "https://npmmirror.com/mirrors/node"
+$OfficialNodeMirror = "https://nodejs.org/dist"
+$ChinaNpmRegistry = "https://registry.npmmirror.com"
+$OfficialNpmRegistry = "https://registry.npmjs.org"
 
 function Write-Step([string]$Message) { Write-Host "`n==> $Message" -ForegroundColor Cyan }
 function Write-Ok([string]$Message) { Write-Host "OK  $Message" -ForegroundColor Green }
@@ -35,6 +58,61 @@ function Write-Utf8NoBom([string]$Path, [string]$Content) {
 
 function Test-Command([string]$Name) {
   return [bool](Get-Command $Name -ErrorAction SilentlyContinue)
+}
+
+function Test-HttpUrl([string]$Url, [int]$TimeoutSeconds = 8) {
+  try {
+    $request = [System.Net.HttpWebRequest]::Create($Url)
+    $request.Method = "HEAD"
+    $request.Timeout = $TimeoutSeconds * 1000
+    $request.AllowAutoRedirect = $true
+    $response = $request.GetResponse()
+    try { return [int]$response.StatusCode -ge 200 -and [int]$response.StatusCode -lt 400 }
+    finally { $response.Dispose() }
+  } catch {
+    return $false
+  }
+}
+
+function Get-MirrorCandidates([string]$ChinaUrl, [string]$OfficialUrl) {
+  switch ($Mirror) {
+    "china" { return @($ChinaUrl, $OfficialUrl) }
+    "official" { return @($OfficialUrl) }
+    default { return @($ChinaUrl, $OfficialUrl) }
+  }
+}
+
+function Invoke-DownloadWithFallback([string[]]$Urls, [string]$Destination) {
+  foreach ($url in $Urls) {
+    try {
+      Write-Host "    download: $url" -ForegroundColor DarkGray
+      Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $Destination -TimeoutSec 60
+      return $url
+    } catch {
+      Write-WarnLine "download failed from $url"
+      Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue
+    }
+  }
+  throw "All download sources failed: $($Urls -join ', ')"
+}
+
+function Add-PrivateNodeToPath {
+  $bin = $NodePrefix
+  if (Test-Path (Join-Path $bin "node.exe")) {
+    $env:Path = "$bin;$env:Path"
+  }
+}
+
+function Clear-OwnedNodePrefix {
+  $full = [System.IO.Path]::GetFullPath($NodePrefix)
+  $root = [System.IO.Path]::GetPathRoot($full)
+  if ($full.TrimEnd('\') -eq $root.TrimEnd('\')) { throw "Refusing to use a drive root as NodePrefix: $full" }
+  if (-not (Test-Path -LiteralPath $full)) { return }
+  $marker = Join-Path $full ".dsh-auto-node-runtime"
+  if (-not (Test-Path -LiteralPath $marker)) {
+    throw "Refusing to replace non-owned directory $full. Choose an empty -NodePrefix or remove it yourself."
+  }
+  Remove-Item -LiteralPath $full -Recurse -Force
 }
 
 function Invoke-Native([string]$File, [string[]]$Arguments) {
@@ -93,33 +171,90 @@ function Get-NodeVersionParts {
   }
 }
 
-function Assert-NodeVersion {
+function Test-NodeVersion {
+  if (-not (Test-Command node)) { return $false }
   $v = Get-NodeVersionParts
   $ok = ($v.Major -gt 22) -or ($v.Major -eq 22 -and $v.Minor -ge $MinNodeMinorIf22) -or ($v.Major -ge 24)
   # Also accept 23? Official says ^22.19 || >=24, so 23 is outside. Reject 23.
   if ($v.Major -eq 23) { $ok = $false }
-  if (-not $ok) {
-    throw "Node.js v$($v.Raw) is too old. Need ^22.19.0 or >=24.0.0 (see https://nodejs.org/)."
-  }
-  Write-Ok "Node.js v$($v.Raw)"
+  return $ok
 }
 
-function Install-NodeIfMissing {
-  if (Test-Command node) { return }
-  Write-WarnLine "Node.js not found."
-  if ($env:OS -match "Windows") {
-    if (Test-Command winget) {
-      Write-Step "Installing Node.js LTS via winget..."
-      $null = Invoke-Native "winget" @("install", "-e", "--id", "OpenJS.NodeJS.LTS", "--accept-package-agreements", "--accept-source-agreements")
-      $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";" +
-        [System.Environment]::GetEnvironmentVariable("Path", "User")
-      if (-not (Test-Command node)) {
-        throw "Node.js installed but not on PATH in this shell. Open a new PowerShell and re-run start.ps1."
-      }
-      return
-    }
+function Install-PrivateNode {
+  $arch = switch ([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()) {
+    "X64" { "x64" }
+    "Arm64" { "arm64" }
+    default { throw "No supported Node.js Windows build for $([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture)" }
   }
-  throw "Install Node.js ^22.19 or >=24 from https://nodejs.org/ then re-run start.ps1."
+  $latestPath = "latest-v$NodeMajorTarget.x"
+  $checksumName = "SHASUMS256.txt"
+  $tempRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("dsh-node-" + [guid]::NewGuid().ToString("N"))
+  New-Item -ItemType Directory -Force -Path $tempRoot | Out-Null
+  try {
+    $checksumPath = Join-Path $tempRoot $checksumName
+    $bases = Get-MirrorCandidates "$ChinaNodeMirror/$latestPath" "$OfficialNodeMirror/$latestPath"
+    $checksumUrls = @($bases | ForEach-Object { "$_/$checksumName" })
+    $usedChecksumUrl = Invoke-DownloadWithFallback $checksumUrls $checksumPath
+    $line = Get-Content -LiteralPath $checksumPath | Where-Object { $_ -match "node-v[0-9.]+-win-$arch\.zip$" } | Select-Object -First 1
+    if (-not $line) { throw "Could not find a win-$arch archive in $usedChecksumUrl" }
+    $parts = $line -split '\s+', 2
+    $expectedHash = $parts[0].Trim()
+    $archiveName = $parts[1].Trim()
+    $archivePath = Join-Path $tempRoot $archiveName
+    $baseUsed = $usedChecksumUrl.Substring(0, $usedChecksumUrl.LastIndexOf('/'))
+    $archiveUrls = @("$baseUsed/$archiveName")
+    foreach ($base in $bases) {
+      $candidate = "$base/$archiveName"
+      if ($archiveUrls -notcontains $candidate) { $archiveUrls += $candidate }
+    }
+    $null = Invoke-DownloadWithFallback $archiveUrls $archivePath
+    $actualHash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA256).Hash
+    if ($actualHash -ne $expectedHash) { throw "Checksum mismatch for $archiveName" }
+    $extractPath = Join-Path $tempRoot "extract"
+    Expand-Archive -LiteralPath $archivePath -DestinationPath $extractPath -Force
+    $sourceDir = Get-ChildItem -LiteralPath $extractPath -Directory | Select-Object -First 1
+    if (-not $sourceDir) { throw "Downloaded Node.js archive has no top-level directory" }
+    Clear-OwnedNodePrefix
+    New-Item -ItemType Directory -Force -Path (Split-Path -Parent $NodePrefix) | Out-Null
+    Move-Item -LiteralPath $sourceDir.FullName -Destination $NodePrefix
+    New-Item -ItemType File -Force -Path (Join-Path $NodePrefix ".dsh-auto-node-runtime") | Out-Null
+  } finally {
+    Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
+  }
+  Add-PrivateNodeToPath
+  if (-not (Test-NodeVersion)) { throw "Private Node.js install in $NodePrefix is unusable" }
+  Write-Ok "Node.js $((Get-NativeLine 'node' @('-v'))) installed in $NodePrefix"
+}
+
+function Ensure-Node {
+  Add-PrivateNodeToPath
+  if ((Test-NodeVersion) -and -not $ForceNode) {
+    Write-Ok "Node.js $((Get-NativeLine 'node' @('-v')))"
+    return
+  }
+  if ($ForceNode -and (Test-NodeVersion)) { Write-WarnLine "private Node.js reinstall requested" }
+  elseif (Test-Command node) { Write-WarnLine "Node.js $((Get-NativeLine 'node' @('-v'))) is outside ^22.19.0 or >=24.0.0" }
+  else { Write-WarnLine "Node.js not found" }
+  if ($CheckOnly) {
+    Write-WarnLine "would install a private Node.js v$NodeMajorTarget runtime in $NodePrefix"
+    return
+  }
+  Write-Step "Installing a private Node.js v$NodeMajorTarget runtime"
+  Install-PrivateNode
+}
+
+function Configure-NpmRegistry {
+  $candidates = Get-MirrorCandidates $ChinaNpmRegistry $OfficialNpmRegistry
+  $selected = $null
+  foreach ($candidate in $candidates) {
+    if (Test-HttpUrl $candidate) { $selected = $candidate; break }
+  }
+  if (-not $selected) {
+    $selected = $candidates[0]
+    Write-WarnLine "npm registries did not answer the probe; installation will still try $selected"
+  }
+  $env:npm_config_registry = $selected
+  Write-Ok "npm registry $selected (current run only)"
 }
 
 function Ensure-NpmDeps {
@@ -267,18 +402,26 @@ function Stop-PortListener([int]$ListenPort) {
 
 # --- main ---
 Write-Step "Environment check"
-Install-NodeIfMissing
-if (-not (Test-Command npm)) { throw "npm not found on PATH (should ship with Node.js)." }
-Write-Ok "npm $(Get-NativeLine "npm" @("-v"))"
-Assert-NodeVersion
+Write-Ok "Windows $([System.Environment]::OSVersion.Version) / PowerShell $($PSVersionTable.PSVersion) / $([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture)"
+Ensure-Node
+Configure-NpmRegistry
+if ($CheckOnly) {
+  if (Test-Command npm) { Write-Ok "npm $(Get-NativeLine 'npm' @('-v'))" } else { Write-WarnLine "npm unavailable until Node.js is installed" }
+  if ($Tailscale) { Write-Host "Tailscale requested; it will be checked during a normal run." -ForegroundColor DarkGray }
+  else { Write-Ok "Tailscale disabled by default" }
+  Write-Step "Check-only run finished (nothing was installed, patched or started)"
+  exit 0
+}
+if (-not (Test-Command npm)) { throw "npm not found after Node.js setup." }
+Write-Ok "npm $(Get-NativeLine 'npm' @('-v'))"
 
 $dshJs = Ensure-NpmDeps
 Assert-NativeDeps
 Apply-LanPatches
 
 $trusted = New-Object System.Collections.Generic.List[string]
-$ts = Get-TailscaleSelf
-if ($null -ne $ts) {
+$ts = if ($Tailscale) { Get-TailscaleSelf } else { $null }
+if ($Tailscale -and $null -ne $ts) {
   Write-Ok "Tailscale $($ts.DnsName) ($($ts.IPv4))"
   Write-Step "Exposing port $Port on Tailscale HTTPS :$TsHttpsPort (root :443 unchanged)"
   $serveExit = Invoke-Native "tailscale" @("serve", "--bg", "--https=$TsHttpsPort", "--yes", "$Port")
@@ -286,8 +429,10 @@ if ($null -ne $ts) {
   foreach ($h in @($ts.DnsName, "$($ts.DnsName):443", "$($ts.DnsName):$TsHttpsPort", $ts.IPv4, "$($ts.IPv4):$Port", "$($ts.IPv4):$TsHttpsPort")) {
     $trusted.Add($h) | Out-Null
   }
+} elseif ($Tailscale) {
+  Write-WarnLine "Tailscale was requested but is unavailable; continuing on 127.0.0.1 only."
 } else {
-  Write-WarnLine "Tailscale not available — local-only bind (127.0.0.1). Install Tailscale for LAN access."
+  Write-Ok "Tailscale disabled (pass -Tailscale to enable it)"
 }
 
 Write-Step "Starting dsh web on 127.0.0.1:$Port"

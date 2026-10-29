@@ -1,4 +1,4 @@
-# DeepSeek Harness — 服务器（Linux）一键部署包
+# DeepSeek Harness — Windows / Linux 一键运行与部署包
 
 针对 `@deepseek-ai/dsh` **0.2.1-rc.3** 校准。`start.sh` 是 `start.ps1` 的 Linux 对等版。
 
@@ -7,7 +7,7 @@
 | 文件 | 用途 |
 | --- | --- |
 | `start.sh` | Linux 一键脚本：环境检查 → 装依赖 → 打补丁 → 配 tailnet → systemd 启动 → 自验证 |
-| `start.ps1` | Windows 版（同一套补丁逻辑，留着备用） |
+| `start.ps1` | Windows 一键脚本：检测环境 → 下载私有 Node → 装依赖 → 打补丁 → 启动 |
 | `package.json` / `package-lock.json` | 依赖清单，`npm ci` 用；已锁定 `@deepseek-ai/dsh@0.2.1-rc.3` |
 | `README-linux.md` | 本文件 |
 
@@ -15,10 +15,10 @@
 
 ## 前提
 
-- Linux（x86_64 或 arm64），有 systemd（要用开机自启的话）
-- 有 `python3` 或 `perl`（用于打补丁；脚本会探测哪个可用）
-- 装了 Tailscale 并已登录（没有也行，加 `--no-tailscale` 则只监听本机）
-- 想用 systemd / 装 Node 需要 root
+- Windows x64/arm64，或 Linux x86_64/arm64
+- Linux 需要 `curl` 或 `wget` 以及支持 `.tar.xz` 的 `tar`；补丁可使用 Node，无需预装 Python
+- Tailscale 默认不启用；需要 tailnet HTTPS 入口时显式传 `-Tailscale`（Windows）或 `--tailscale`（Linux）
+- 只有安装或卸载 systemd 服务需要 root；私有 Node 下载到仓库内，不需要 root
 - **浏览器要求（0.2.x 强制）**：Firefox ≥ **121** / Chrome ≥ **119** / Safari ≥ **17.4**。
   更旧的浏览器会**白屏**，控制台报 `Promise.withResolvers is not a function` 或
   `SyntaxError: expected property name, got '{'`（后者是看不懂 `class { static {} }`，Firefox 93+ 才有）。
@@ -29,13 +29,15 @@
 | 参数 | 说明 |
 | --- | --- |
 | `--port N` | dsh 监听端口，默认 `3080` |
+| `--tailscale` | 显式启用可选的 Tailscale HTTPS 入口；默认只监听本机 |
 | `--ts-port N` | tailscale serve 的 HTTPS 端口，默认 `443` |
-| `--no-tailscale` | 只监听本机，不做 tailnet 入口 |
+| `--no-tailscale` | 兼容参数；保持默认的本机模式 |
+| `--mirror auto\|china\|official` | 下载源；默认优先国内镜像，失败回退官方源 |
 | `--install-service` | 装 systemd 单元并开机自启 |
 | `--uninstall-service` | 卸掉 systemd 单元（tailnet 入口不动） |
 | `--user NAME` | 服务以哪个用户运行，默认 `$SUDO_USER` 或 `root` |
 | `--service-name NAME` | systemd 单元名，默认 `dsh` |
-| `--node-prefix DIR` | 私有 Node 装哪，默认 `/opt/dsh-auto/node` |
+| `--node-prefix DIR` | 私有 Node 安装目录，默认 `<仓库>/.runtime/node` |
 | `--check-only` | 只出环境报告，不做任何改动 |
 | `--selftest` | 只验脚本自身逻辑（版本比较、打补丁、信任行），零副作用 |
 | `--diagnose` | **只读诊断**：页面空白时跑这个，直接给结论（见下） |
@@ -47,7 +49,7 @@
 | 位置 | 什么时候 | 会覆盖别人的东西吗 |
 | --- | --- | --- |
 | `<仓库目录>/node_modules` | 总是 | 不会，只在这个目录里 |
-| `<node-prefix>`（默认 `/opt/dsh-auto/node`） | **仅当**主机没有可用的 Node 时才装 | 不会。**故意不装进 `/usr/local`**——那样会顶掉全机的 `node`/`npm` 并遮蔽发行版的 Node |
+| `<仓库>/.runtime/node` | 主机没有兼容 Node 时自动下载 | 不会；只对本次脚本及其服务生效，不覆盖系统 Node |
 | `<服务用户 home>/.dsh/profiles/web/cordis.patch.yml` | 有 tailnet 入口时 | 只**追加**一行 `connection`；已存在则跳过 |
 | `/etc/systemd/system/<服务名>.service` | 仅 `--install-service` | 文件已存在且不是本脚本写的 → **拒绝**，除非 `--force` |
 | `tailscale serve --https=<端口>` 映射 | 有 tailnet 入口时 | 该端口已被别的服务占用 → **拒绝**，除非 `--force` |
@@ -59,20 +61,40 @@
 跑任何有副作用的步骤之前先检查三件事，冲突就停下来告诉你：
 
 1. dsh 端口被别的进程占用 → 拒绝，提示换 `--port N`
-2. tailscale HTTPS 端口已在服务别的东西 → 拒绝，提示换 `--ts-port N`
+2. 显式启用 Tailscale 后，其 HTTPS 端口已在服务别的东西 → 拒绝，提示换 `--ts-port N`
 3. 同名 systemd 单元存在但不是本脚本写的 → 拒绝，提示 `--service-name` 或 `--force`
 
 （若端口是被本脚本自己装的单元占用，则识别为"重装"，正常继续。）
 
-## 三步上手
+## Windows 上手
+
+默认优先使用 `npmmirror.com` 下载 Node，并将 npm 临时指向 `registry.npmmirror.com`；镜像不可用时自动回退官方源。配置只对当前启动生效，不修改用户的全局 npm 设置。
+
+```powershell
+# 只检查，不下载、不修改、不启动
+powershell -ExecutionPolicy Bypass -File .\start.ps1 -CheckOnly
+
+# 自动补齐 Node/npm 环境、安装依赖并启动；默认不使用 Tailscale
+powershell -ExecutionPolicy Bypass -File .\start.ps1
+
+# 确实需要 tailnet HTTPS 入口时再显式启用
+powershell -ExecutionPolicy Bypass -File .\start.ps1 -Tailscale
+
+# 强制只用官方源
+powershell -ExecutionPolicy Bypass -File .\start.ps1 -Mirror official
+```
+
+## Linux 三步上手
 
 ```bash
 chmod +x start.sh                 # 解包后补执行位（或直接用 bash ./start.sh）
 
 ./start.sh --selftest             # ① 零副作用：验脚本自身逻辑（版本比较、打补丁引擎）
 sudo ./start.sh --check-only      # ② 只出环境报告，不装任何东西
-sudo ./start.sh --install-service # ③ 正式装机 + 开机自启
+sudo ./start.sh --install-service # ③ 正式装机 + 开机自启（默认不使用 Tailscale）
 ```
+
+Linux 同样优先使用国内 Node/npm 镜像；可传 `--mirror official` 只使用官方源。需要 Tailscale 时使用 `sudo ./start.sh --install-service --tailscale`。
 
 装完脚本自己会跑一遍验证：`401`（0.2.x 鉴权生效）→ 带 token 换 cookie（`303`）→ 页面 `200` → `WS /api/remote.mux` `101`。
 
@@ -111,7 +133,7 @@ tailscale serve --https=443 off              # 撤掉 tailnet 入口
 
 ## 安全边界
 
-- dsh 只绑 `127.0.0.1`，唯一入口是 `tailscale serve`（**tailnet only，脚本从不使用 Funnel**）
+- dsh 始终只绑定 `127.0.0.1`；默认只能在本机访问。显式启用 Tailscale 后，唯一远程入口是 `tailscale serve`（**tailnet only，脚本从不使用 Funnel**）
 - 0.2.x 对所有请求鉴权；token + 30 天 cookie
 - 门禁范围 = 整个 tailnet。公网服务器上的 tailnet 成员、以及带 tag 的设备（如 app-connector / exit node）都能访问这个 GUI
 - **不要**给 dsh 端口开公网防火墙规则；脚本也不会开

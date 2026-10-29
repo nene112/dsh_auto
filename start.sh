@@ -12,8 +12,8 @@
 #    4. trust config        : ~/.dsh/profiles/web/cordis.patch.yml gets the
 #                             tailnet authority in the `connection` row, so /api
 #                             is not fenced off (403) through tailscale serve
-#    5. tailnet entry       : `tailscale serve --bg --https=<port>` - TAILNET
-#                             ONLY, never Funnel; dsh itself stays on 127.0.0.1
+#    5. optional tailnet entry: only with --tailscale; dsh itself stays on
+#                             127.0.0.1 and Tailscale is ignored by default
 #    6. start               : systemd unit (survives reboot) or foreground
 #    7. verify              : page, first-visit token URL, WebSocket mux upgrade
 #
@@ -34,12 +34,14 @@
 #
 #  Options:
 #    --port N            dsh listen port              (default 3080)
+#    --tailscale         enable the optional tailnet HTTPS entry
 #    --ts-port N         tailscale serve HTTPS port   (default 443)
-#    --no-tailscale      skip the tailnet entry (loopback only)
+#    --no-tailscale      compatibility alias for the default local-only mode
+#    --mirror MODE       auto, china, or official     (default auto)
 #    --user NAME         user for the systemd unit    (default: $SUDO_USER or $USER)
 #    --clone             git clone this repo first when run outside a checkout
-#    --force-node        install Node from nodejs.org even if a usable one exists
-#    --node-prefix DIR   where a private Node goes    (default /opt/dsh-auto/node)
+#    --force-node        reinstall the private Node runtime even if Node is usable
+#    --node-prefix DIR   where a private Node goes    (default <repo>/.runtime/node)
 #    --service-name NAME systemd unit name            (default dsh)
 #    --force             proceed past a preflight conflict (see below)
 #
@@ -64,7 +66,7 @@ set -euo pipefail
 
 PORT=3080
 TS_PORT=443
-USE_TAILSCALE=1
+USE_TAILSCALE=0
 INSTALL_SERVICE=0
 UNINSTALL_SERVICE=0
 CHECK_ONLY=0
@@ -76,12 +78,16 @@ DIAGNOSE=0
 SERVICE_USER=""
 SERVICE_NAME="dsh"
 NODE_MAJOR_TARGET="24"
-# Node goes into this private prefix when (and only when) the host has no usable
-# Node. Deliberately NOT /usr/local: extracting the tarball there would overwrite
-# node/npm for every user on the box and shadow a distro-installed Node.
-NODE_PREFIX="/opt/dsh-auto/node"
+MIRROR_MODE="${DSH_MIRROR:-auto}"
+CHINA_NODE_MIRROR="https://npmmirror.com/mirrors/node"
+OFFICIAL_NODE_MIRROR="https://nodejs.org/dist"
+CHINA_NPM_REGISTRY="https://registry.npmmirror.com"
+OFFICIAL_NPM_REGISTRY="https://registry.npmjs.org"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# Keep the downloaded runtime inside this checkout. It needs no root access and
+# does not shadow a distribution-managed Node installation.
+NODE_PREFIX="${DSH_NODE_PREFIX:-$SCRIPT_DIR/.runtime/node}"
 
 if [ -t 1 ]; then
   C_RESET=$'\033[0m'; C_OK=$'\033[32m'; C_WARN=$'\033[33m'; C_ERR=$'\033[31m'; C_STEP=$'\033[36m'
@@ -99,7 +105,9 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --port) PORT="${2:?}"; shift 2 ;;
     --ts-port) TS_PORT="${2:?}"; shift 2 ;;
+    --tailscale) USE_TAILSCALE=1; shift ;;
     --no-tailscale) USE_TAILSCALE=0; shift ;;
+    --mirror) MIRROR_MODE="${2:?}"; shift 2 ;;
     --install-service) INSTALL_SERVICE=1; shift ;;
     --uninstall-service) UNINSTALL_SERVICE=1; shift ;;
     --check-only) CHECK_ONLY=1; shift ;;
@@ -115,6 +123,11 @@ while [ $# -gt 0 ]; do
     *) die "unknown argument: $1 (try --help)" ;;
   esac
 done
+
+case "$MIRROR_MODE" in
+  auto|china|official) ;;
+  *) die "invalid --mirror value '$MIRROR_MODE' (use auto, china, or official)" ;;
+esac
 
 # ---------------------------------------------------------------- helpers
 
@@ -137,6 +150,8 @@ patch_engine() { # -> python3 | perl | none, probed once so a broken tool is not
       PATCH_ENGINE=python3
     elif command -v perl >/dev/null 2>&1 && perl -e '1' >/dev/null 2>&1; then
       PATCH_ENGINE=perl
+    elif command -v node >/dev/null 2>&1 && node -e '' >/dev/null 2>&1; then
+      PATCH_ENGINE=node
     else
       PATCH_ENGINE=none
     fi
@@ -162,6 +177,56 @@ fetch() { # fetch <url> <dest>
   else die "need curl or wget to download $1"; fi
 }
 
+url_reachable() { # url_reachable <url>
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsIL --max-time 8 "$1" >/dev/null 2>&1
+  elif command -v wget >/dev/null 2>&1; then
+    wget --spider -q -T 8 "$1" >/dev/null 2>&1
+  else
+    return 1
+  fi
+}
+
+select_npm_registry() {
+  case "$MIRROR_MODE" in
+    official) printf '%s' "$OFFICIAL_NPM_REGISTRY" ;;
+    china)
+      if url_reachable "$CHINA_NPM_REGISTRY"; then printf '%s' "$CHINA_NPM_REGISTRY"
+      else warn "China npm mirror probe failed; falling back to the official registry" >&2; printf '%s' "$OFFICIAL_NPM_REGISTRY"; fi ;;
+    auto)
+      if url_reachable "$CHINA_NPM_REGISTRY"; then printf '%s' "$CHINA_NPM_REGISTRY"
+      else printf '%s' "$OFFICIAL_NPM_REGISTRY"; fi ;;
+  esac
+}
+
+node_bases() {
+  case "$MIRROR_MODE" in
+    official) printf '%s\n' "$OFFICIAL_NODE_MIRROR" ;;
+    *) printf '%s\n%s\n' "$CHINA_NODE_MIRROR" "$OFFICIAL_NODE_MIRROR" ;;
+  esac
+}
+
+fetch_node_file() { # fetch_node_file <relative-path> <dest>; prints the base used
+  local rel="$1" dest="$2" base
+  while IFS= read -r base; do
+    [ -n "$base" ] || continue
+    if fetch "$base/$rel" "$dest" 2>/dev/null; then printf '%s' "$base"; return 0; fi
+    warn "download failed from $base/$rel" >&2
+    rm -f "$dest"
+  done < <(node_bases)
+  return 1
+}
+
+clear_owned_node_prefix() {
+  [ -n "$NODE_PREFIX" ] || die "node prefix is empty"
+  case "$NODE_PREFIX" in /|/usr|/usr/local|/opt|/home|/root) die "refusing unsafe --node-prefix $NODE_PREFIX" ;; esac
+  if [ -e "$NODE_PREFIX" ]; then
+    [ -f "$NODE_PREFIX/.dsh-auto-node-runtime" ] \
+      || die "refusing to replace non-owned directory $NODE_PREFIX; choose an empty --node-prefix or remove it yourself"
+    rm -rf -- "$NODE_PREFIX"
+  fi
+}
+
 # literal string replacement; python3 preferred, perl as fallback. The result is
 # verified with grep - a patch that did not land must never report success.
 patch_literal() { # patch_literal <file> <old> <new> <marker> <label>
@@ -183,6 +248,22 @@ PY
     perl)
       OLD="$old" NEW="$new" perl -0777 -pi -e 'my $o=$ENV{OLD}; my $n=$ENV{NEW}; s/\Q$o\E/$n/;' "$file" \
         || { err "$label: perl replacement failed"; return 1; }
+      ;;
+    node)
+      local tmp_file="${file}.dsh-auto.tmp"
+      if ! OLD="$old" NEW="$new" node -e '
+const fs = require("fs");
+const oldText = process.env.OLD;
+const newText = process.env.NEW;
+const text = fs.readFileSync(0, "utf8");
+if (!text.includes(oldText)) process.exit(2);
+process.stdout.write(text.replace(oldText, newText));
+' < "$file" > "$tmp_file"; then
+        rm -f "$tmp_file"
+        err "$label: node replacement failed"
+        return 1
+      fi
+      mv "$tmp_file" "$file"
       ;;
     *)
       err "$label: no working python3 or perl, cannot patch"; return 1 ;;
@@ -473,14 +554,7 @@ case "$ARCH_RAW" in
   *) NODE_ARCH="" ;;
 esac
 ok "$OS_PRETTY ($ARCH_RAW)"
-[ "$(id -u)" = "0" ] && ok "running as root" || warn "not root: installing Node/systemd needs root, patching node_modules does not"
-
-if command -v python3 >/dev/null 2>&1; then ok "python3 present ($(python3 -V 2>&1 | awk '{print $2}'))"; fi
-case "$(patch_engine)" in
-  python3) ok "patch engine: python3" ;;
-  perl)    warn "patch engine: perl (python3 missing or broken)" ;;
-  *)       die "need a working python3 or perl to apply the LAN patches" ;;
-esac
+[ "$(id -u)" = "0" ] && ok "running as root" || ok "running unprivileged (private Node is supported; systemd management still needs root)"
 
 if [ "$DO_CLONE" = "1" ] && [ ! -f "$SCRIPT_DIR/package.json" ]; then
   step "Cloning the launcher repository"
@@ -493,6 +567,11 @@ fi
 [ -f "$SCRIPT_DIR/package.json" ] || die "no package.json in $SCRIPT_DIR - run this from the launcher checkout (or pass --clone)"
 cd "$SCRIPT_DIR"
 
+if [ -x "$NODE_PREFIX/bin/node" ]; then
+  PATH="$NODE_PREFIX/bin:$PATH"; export PATH
+  hash -r
+fi
+
 if node_usable && [ "$FORCE_NODE" = "0" ]; then
   ok "Node.js $(node -v) (within ^22.19 || >=24)"
 else
@@ -502,20 +581,26 @@ else
     warn "Node.js not found"
   fi
   if [ "$CHECK_ONLY" = "1" ]; then
-    warn "would install Node.js v$NODE_MAJOR_TARGET from nodejs.org (skipped: --check-only)"
+    warn "would install a private Node.js v$NODE_MAJOR_TARGET runtime in $NODE_PREFIX (skipped: --check-only)"
   else
-    [ "$(id -u)" = "0" ] || die "installing Node needs root - re-run with sudo, or install Node yourself"
     [ -n "$NODE_ARCH" ] || die "no official Node build for $ARCH_RAW"
     step "Installing Node.js v$NODE_MAJOR_TARGET into the private prefix $NODE_PREFIX"
-    BASE="https://nodejs.org/dist/latest-v${NODE_MAJOR_TARGET}.x"
+    REL_BASE="latest-v${NODE_MAJOR_TARGET}.x"
     TMP="$(mktemp -d)"
-    fetch "$BASE/SHASUMS256.txt" "$TMP/SHASUMS256.txt"
+    USED_BASE="$(fetch_node_file "$REL_BASE/SHASUMS256.txt" "$TMP/SHASUMS256.txt")" \
+      || die "could not download Node.js checksums from the configured mirrors"
     FILE="$(grep -o "node-v[0-9.]*-linux-${NODE_ARCH}\.tar\.xz" "$TMP/SHASUMS256.txt" | head -n1)"
     [ -n "$FILE" ] || die "could not find a linux-${NODE_ARCH} tarball in SHASUMS256.txt"
-    fetch "$BASE/$FILE" "$TMP/$FILE"
+    if ! fetch "$USED_BASE/$REL_BASE/$FILE" "$TMP/$FILE" 2>/dev/null; then
+      warn "archive download failed from the checksum mirror; trying configured fallbacks"
+      fetch_node_file "$REL_BASE/$FILE" "$TMP/$FILE" >/dev/null \
+        || die "could not download $FILE from the configured mirrors"
+    fi
     ( cd "$TMP" && grep " $FILE\$" SHASUMS256.txt | sha256sum -c - ) || die "checksum mismatch for $FILE"
+    clear_owned_node_prefix
     mkdir -p "$NODE_PREFIX"
     tar -xJf "$TMP/$FILE" -C "$NODE_PREFIX" --strip-components=1 --no-same-owner
+    : > "$NODE_PREFIX/.dsh-auto-node-runtime"
     rm -rf "$TMP"
     PATH="$NODE_PREFIX/bin:$PATH"; export PATH
     hash -r
@@ -525,6 +610,19 @@ else
 fi
 
 command -v npm >/dev/null 2>&1 && ok "npm $(npm -v 2>/dev/null || echo '?')" || warn "npm not on PATH"
+NPM_REGISTRY="$(select_npm_registry)"
+npm_config_registry="$NPM_REGISTRY"; export npm_config_registry
+ok "npm registry $NPM_REGISTRY (current run only)"
+
+unset PATCH_ENGINE || true
+case "$(patch_engine)" in
+  python3) ok "patch engine: python3" ;;
+  perl)    ok "patch engine: perl" ;;
+  node)    ok "patch engine: node" ;;
+  *)
+    if [ "$CHECK_ONLY" = "1" ]; then warn "no patch engine yet; the private Node install would provide one"
+    else die "no working patch engine after Node.js setup"; fi ;;
+esac
 
 TS_DNS=""
 if [ "$USE_TAILSCALE" = "1" ]; then
@@ -538,7 +636,7 @@ if [ "$USE_TAILSCALE" = "1" ]; then
     ok "Tailscale node $TS_DNS"
   fi
 else
-  ok "tailnet entry disabled by --no-tailscale"
+  ok "Tailscale disabled by default (pass --tailscale to enable it)"
 fi
 
 if [ "$INSTALL_SERVICE" = "1" ] || [ "$UNINSTALL_SERVICE" = "1" ]; then
@@ -749,12 +847,20 @@ if [ "$INSTALL_SERVICE" = "1" ]; then
   RUN_HOME="${RUN_HOME:-$(getent passwd "$RUN_USER" | cut -d: -f6)}"
   [ -n "$RUN_HOME" ] || RUN_HOME="/root"
   NODE_EXE="$(command -v node)"
+  UNIT_DESCRIPTION="DeepSeek Harness web UI"
+  UNIT_AFTER="network-online.target"
+  UNIT_WANTS="network-online.target"
+  if [ "$USE_TAILSCALE" = "1" ]; then
+    UNIT_DESCRIPTION="$UNIT_DESCRIPTION (Tailscale tailnet entry)"
+    UNIT_AFTER="$UNIT_AFTER tailscaled.service"
+    UNIT_WANTS="$UNIT_WANTS tailscaled.service"
+  fi
   cat > "$UNIT_PATH" <<EOF
 # Written by dsh_auto/start.sh - remove with: start.sh --uninstall-service
 [Unit]
-Description=DeepSeek Harness web UI (Tailscale tailnet entry)
-After=network-online.target tailscaled.service
-Wants=network-online.target tailscaled.service
+Description=$UNIT_DESCRIPTION
+After=$UNIT_AFTER
+Wants=$UNIT_WANTS
 
 [Service]
 Type=simple
